@@ -48,6 +48,7 @@ pub struct DeviceBuilder<Udp, TunTx, TunRx> {
     peers: Vec<Peer>,
     index_table: Option<IndexTable>,
     suspended: bool,
+    awg: Option<AwgConfig>,
 
     #[cfg(target_os = "linux")]
     fwmark: Option<u32>,
@@ -83,6 +84,7 @@ impl DeviceBuilder<Nul, Nul, Nul> {
             peers: Vec::new(),
             index_table: None,
             suspended: false,
+            awg: None,
             #[cfg(target_os = "linux")]
             fwmark: None,
         }
@@ -110,6 +112,7 @@ impl<X, Y> DeviceBuilder<Nul, X, Y> {
             peers: self.peers,
             index_table: self.index_table,
             suspended: self.suspended,
+            awg: self.awg,
             #[cfg(target_os = "linux")]
             fwmark: self.fwmark,
         }
@@ -186,6 +189,7 @@ impl<X> DeviceBuilder<X, Nul, Nul> {
             peers: self.peers,
             index_table: self.index_table,
             suspended: self.suspended,
+            awg: self.awg,
             #[cfg(target_os = "linux")]
             fwmark: self.fwmark,
         }
@@ -247,6 +251,14 @@ impl<X, Y, Z> DeviceBuilder<X, Y, Z> {
         self
     }
 
+    /// Set the AmneziaWG obfuscation configuration.
+    ///
+    /// By default, standard WireGuard behavior is used (no obfuscation).
+    pub fn with_awg(mut self, awg: AwgConfig) -> Self {
+        self.awg = Some(awg);
+        self
+    }
+
     /// Specify the `SO_MARK` argument to the [`UdpTransportFactory`].
     ///
     /// You probably only want this when using [`with_default_udp`](Self::with_default_udp).
@@ -289,7 +301,7 @@ impl<Udp: UdpTransportFactory, TunTx: IpSend, TunRx: IpRecv> DeviceBuilder<Udp, 
             peers_by_idx: parking_lot::Mutex::new(Default::default()),
             peers_by_ip: AllowedIps::new(),
             rate_limiter: None,
-            awg: AwgConfig::default(),
+            awg: self.awg.unwrap_or_default(),
             port: self.port,
             connection: None,
             suspended: self.suspended,
