@@ -29,6 +29,7 @@ mod timers;
 use rand::{RngCore, SeedableRng, rngs::StdRng};
 use zerocopy::IntoBytes;
 
+use crate::noise::awg::AwgConfig;
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::Handshake;
 use crate::noise::index_table::IndexTable;
@@ -36,6 +37,7 @@ use crate::noise::rate_limiter::RateLimiter;
 use crate::noise::timers::{TimerName, Timers};
 
 pub use crate::noise::timers::TimerParams;
+use crate::packet::CheckedPayload;
 use crate::packet::{Packet, WgCookieReply, WgData, WgHandshakeInit, WgHandshakeResp, WgKind};
 use crate::tun::MtuWatcher;
 use crate::x25519;
@@ -88,6 +90,8 @@ pub struct Tunn<R: RngCore + Send = StdRng> {
     rate_limiter: Arc<RateLimiter>,
     /// RNG used for handshake retry jitter.
     jitter_rng: R,
+    /// AmneziaWG obfuscation configuration.
+    awg: AwgConfig,
 }
 
 impl Tunn<StdRng> {
@@ -99,6 +103,7 @@ impl Tunn<StdRng> {
         persistent_keepalive: Option<u16>,
         index_table: IndexTable,
         rate_limiter: Arc<RateLimiter>,
+        awg: AwgConfig,
     ) -> Self {
         Self::new_with_rng(
             static_private,
@@ -107,6 +112,7 @@ impl Tunn<StdRng> {
             persistent_keepalive,
             index_table,
             rate_limiter,
+            awg,
             StdRng::from_os_rng(),
         )
     }
@@ -121,6 +127,7 @@ impl<R: RngCore + Send> Tunn<R> {
         persistent_keepalive: Option<u16>,
         index_table: IndexTable,
         rate_limiter: Arc<RateLimiter>,
+        awg: AwgConfig,
         jitter_rng: R,
     ) -> Self {
         let static_public = x25519::PublicKey::from(&static_private);
@@ -144,6 +151,7 @@ impl<R: RngCore + Send> Tunn<R> {
 
             rate_limiter,
             jitter_rng,
+            awg,
         }
     }
 
@@ -160,6 +168,16 @@ impl<R: RngCore + Send> Tunn<R> {
     pub fn reset(&mut self) {
         self.clear_all();
         self.handshake.reset();
+    }
+
+    /// Get a reference to the AWG configuration.
+    pub fn awg_config(&self) -> &AwgConfig {
+        &self.awg
+    }
+
+    /// Apply AWG header type to an outgoing packet by overwriting the first 4 bytes.
+    fn apply_awg_header<T: CheckedPayload + ?Sized>(&self, packet: &mut Packet<T>, header: u32) {
+        packet.buf_mut()[..4].copy_from_slice(&header.to_le_bytes());
     }
 
     /// Update the private key and clear existing sessions.
@@ -229,7 +247,8 @@ impl<R: RngCore + Send> Tunn<R> {
         let current = self.current;
         if let Some(ref session) = self.sessions[current % N_SESSIONS] {
             // Send the packet using an established session
-            let packet = session.format_packet_data(packet)?;
+            let mut packet = session.format_packet_data(packet)?;
+            self.apply_awg_header(&mut packet, self.awg.h4.generate());
             self.timer_tick(TimerName::TimeLastPacketSent);
             // Exclude Keepalive packets from timer update.
             if !packet.is_keepalive() {
@@ -262,7 +281,8 @@ impl<R: RngCore + Send> Tunn<R> {
         tracing::debug!("Received handshake_initiation: {}", p.sender_idx);
 
         let n_bytes = p.as_bytes().len();
-        let (packet, session) = self.handshake.receive_handshake_initialization(p)?;
+        let (mut packet, session) = self.handshake.receive_handshake_initialization(p)?;
+        self.apply_awg_header(&mut packet, self.awg.h2.generate());
         self.rx_bytes += n_bytes;
 
         // Store new session in next slot
@@ -294,9 +314,10 @@ impl<R: RngCore + Send> Tunn<R> {
         let mut p = p.into_bytes();
         p.truncate(0);
 
-        let keepalive_packet = session
+        let mut keepalive_packet = session
             .format_packet_data(p)
             .expect("a freshly established session's counter cannot be exhausted");
+        self.apply_awg_header(&mut keepalive_packet, self.awg.h4.generate());
         // Store new session in next slot
         let slot = self.next_session_slot();
         self.put_session(slot, session);
@@ -415,7 +436,8 @@ impl<R: RngCore + Send> Tunn<R> {
 
         let starting_new_handshake = !self.handshake.is_in_progress();
 
-        let packet = self.handshake.format_handshake_initiation();
+        let mut packet = self.handshake.format_handshake_initiation();
+        self.apply_awg_header(&mut packet, self.awg.h1.generate());
         tracing::debug!("Sending handshake_initiation");
 
         if starting_new_handshake {
@@ -566,6 +588,7 @@ mod tests {
             persistent_keepalive,
             IndexTable::from_os_rng(),
             rate_limiter,
+            AwgConfig::default(),
         );
 
         let rate_limiter = Arc::new(RateLimiter::new(&their_public_key, HANDSHAKE_RATE_LIMIT));
@@ -576,6 +599,7 @@ mod tests {
             None,
             IndexTable::from_os_rng(),
             rate_limiter,
+            AwgConfig::default(),
         );
 
         (my_tun, their_tun)
@@ -1051,6 +1075,7 @@ mod tests {
             None,
             IndexTable::from_os_rng(),
             rate_limiter,
+            AwgConfig::default(),
             // Use a predictable RNG for the jitter
             FixedRng(200),
         );

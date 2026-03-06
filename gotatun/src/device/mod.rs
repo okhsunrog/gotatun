@@ -39,11 +39,12 @@ use tokio::sync::RwLock;
 use tokio::sync::{Mutex, watch};
 use tracing::{Level, instrument};
 
+use crate::noise::awg::AwgConfig;
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::parse_handshake_anon;
 use crate::noise::rate_limiter::RateLimiter;
 use crate::noise::{Tunn, TunnResult};
-use crate::packet::{PacketBufPool, WgKind};
+use crate::packet::{Packet, PacketBufPool, WgKind};
 use crate::task::Task;
 use crate::tun::{IpRecv, IpSend, MtuWatcher};
 use crate::udp::buffer::{BufferedUdpReceive, BufferedUdpSend};
@@ -134,6 +135,9 @@ pub(crate) struct DeviceState<T: DeviceTransports> {
     /// While suspended, the [`Connection`] (and all its tasks) is torn down so no
     /// traffic flows, but peers, keys, and config are retained for [`Device::resume`].
     suspended: bool,
+
+    /// AmneziaWG obfuscation configuration.
+    awg: AwgConfig,
 
     /// The task that responds to API requests.
     api: Option<Task>,
@@ -429,6 +433,7 @@ impl<T: DeviceTransports> DeviceState<T> {
             peer_builder.keepalive,
             self.index_table.clone(),
             rate_limiter,
+            self.awg.clone(),
         );
 
         if let Some(timer_params) = peer_builder.danger_timer_params {
@@ -585,7 +590,8 @@ impl<T: DeviceTransports> DeviceState<T> {
 
                         // NOTE: we don't bother with triggering TunnelRecv DAITA events here.
 
-                        let _ = udp.send_to(packet.into(), endpoint_addr).await;
+                        let packet = packet.into_packet_with_padding(&device.awg);
+                        let _ = udp.send_to(packet, endpoint_addr).await;
                     }
                     Ok(None) => {}
                     Err(WireGuardError::ConnectionExpired) => {}
@@ -607,7 +613,7 @@ impl<T: DeviceTransports> DeviceState<T> {
         mut udp_rx: impl UdpRecv,
         mut packet_pool: PacketBufPool,
     ) -> Result<(), Error> {
-        let (private_key, public_key, rate_limiter, mut tun_mtu) = {
+        let (private_key, public_key, rate_limiter, mut tun_mtu, awg) = {
             let Some(device) = device.upgrade() else {
                 return Ok(());
             };
@@ -616,15 +622,19 @@ impl<T: DeviceTransports> DeviceState<T> {
             let (private_key, public_key) = device.key_pair.clone().expect("Key not set");
             let rate_limiter = device.rate_limiter.clone().unwrap();
             let tun_mtu = device.tun_rx_mtu.clone();
-            (private_key, public_key, rate_limiter, tun_mtu)
+            let awg = device.awg.clone();
+            (private_key, public_key, rate_limiter, tun_mtu, awg)
         };
 
         while let Ok((src_buf, addr)) = udp_rx.recv_from(&mut packet_pool).await {
-            let parsed_packet = match rate_limiter.verify_packet(addr, src_buf) {
+            let parsed_packet = match rate_limiter.verify_packet(addr, src_buf, &awg) {
                 Ok(packet) => packet,
-                Err(TunnResult::WriteToNetwork(WgKind::CookieReply(cookie))) => {
+                Err(TunnResult::WriteToNetwork(WgKind::CookieReply(mut cookie))) => {
                     // Note: Cookies should not affect counters.
-                    if let Err(_err) = udp_tx.send_to(cookie.into(), addr).await {
+                    cookie.buf_mut()[..4].copy_from_slice(&awg.h3.generate().to_le_bytes());
+                    let cookie_packet: Packet = cookie.into();
+                    let cookie_packet = cookie_packet.prepend_random(awg.s3);
+                    if let Err(_err) = udp_tx.send_to(cookie_packet, addr).await {
                         tracing::trace!("udp.send_to failed");
                         break;
                     }
@@ -690,7 +700,10 @@ impl<T: DeviceTransports> DeviceState<T> {
                     });
 
                     for packet in packets {
-                        if let Err(_err) = udp_tx.send_to(packet.into(), addr).await {
+                        if let Err(_err) = udp_tx
+                            .send_to(packet.into_packet_with_padding(&awg), addr)
+                            .await
+                        {
                             tracing::trace!("udp.send_to failed");
                             break;
                         }
@@ -832,14 +845,14 @@ impl<T: DeviceTransports> DeviceState<T> {
 
                 #[cfg(feature = "daita")]
                 let packet = match daita {
-                    None => packet.into(),
+                    None => packet.into_packet_with_padding(&device_guard.awg),
                     Some(daita) => match daita.on_tunnel_sent(packet) {
-                        Some(packet) => packet.into(),
+                        Some(packet) => packet.into_packet_with_padding(&device_guard.awg),
                         None => continue,
                     },
                 };
                 #[cfg(not(feature = "daita"))]
-                let packet = packet.into();
+                let packet = packet.into_packet_with_padding(&device_guard.awg);
 
                 drop(peer); // release lock
                 drop(device_guard);
