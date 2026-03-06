@@ -15,6 +15,7 @@ use tokio::sync::{Mutex, RwLock, watch};
 use x25519_dalek::StaticSecret;
 
 use crate::device::Error;
+use crate::noise::awg::AwgConfig;
 use crate::noise::index_table::IndexTable;
 #[cfg(feature = "tun")]
 use crate::tun::tun_async_device::TunDevice;
@@ -288,6 +289,7 @@ impl<Udp: UdpTransportFactory, TunTx: IpSend, TunRx: IpRecv> DeviceBuilder<Udp, 
             peers_by_idx: parking_lot::Mutex::new(Default::default()),
             peers_by_ip: AllowedIps::new(),
             rate_limiter: None,
+            awg: AwgConfig::default(),
             port: self.port,
             connection: None,
             suspended: self.suspended,
