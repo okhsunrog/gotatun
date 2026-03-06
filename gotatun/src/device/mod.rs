@@ -590,8 +590,9 @@ impl<T: DeviceTransports> DeviceState<T> {
 
                         // NOTE: we don't bother with triggering TunnelRecv DAITA events here.
 
-                        let packet = packet.into_packet_with_padding(&device.awg);
-                        let _ = udp.send_to(packet, endpoint_addr).await;
+                        for packet in packet.into_send_packets(&device.awg) {
+                            let _ = udp.send_to(packet, endpoint_addr).await;
+                        }
                     }
                     Ok(None) => {}
                     Err(WireGuardError::ConnectionExpired) => {}
@@ -700,12 +701,11 @@ impl<T: DeviceTransports> DeviceState<T> {
                     });
 
                     for packet in packets {
-                        if let Err(_err) = udp_tx
-                            .send_to(packet.into_packet_with_padding(&awg), addr)
-                            .await
-                        {
-                            tracing::trace!("udp.send_to failed");
-                            break;
+                        for send_packet in packet.into_send_packets(&awg) {
+                            if let Err(_err) = udp_tx.send_to(send_packet, addr).await {
+                                tracing::trace!("udp.send_to failed");
+                                break;
+                            }
                         }
                     }
 
@@ -845,19 +845,30 @@ impl<T: DeviceTransports> DeviceState<T> {
 
                 #[cfg(feature = "daita")]
                 let packet = match daita {
-                    None => packet.into_packet_with_padding(&device_guard.awg),
-                    Some(daita) => match daita.on_tunnel_sent(packet) {
-                        Some(packet) => packet.into_packet_with_padding(&device_guard.awg),
-                        None => continue,
-                    },
+                    None => Some(packet),
+                    Some(daita) => daita.on_tunnel_sent(packet),
                 };
                 #[cfg(not(feature = "daita"))]
-                let packet = packet.into_packet_with_padding(&device_guard.awg);
+                let packet = Some(packet);
+
+                let Some(packet) = packet else {
+                    continue;
+                };
+
+                let awg = &device_guard.awg;
+                let send_packets: Vec<_> = packet.into_send_packets(awg).collect();
 
                 drop(peer); // release lock
                 drop(device_guard);
 
-                if udp.send_to(packet, peer_addr).await.is_err() {
+                let mut send_err = false;
+                for packet in send_packets {
+                    if udp.send_to(packet, peer_addr).await.is_err() {
+                        send_err = true;
+                        break;
+                    }
+                }
+                if send_err {
                     break;
                 }
             }
