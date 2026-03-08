@@ -23,6 +23,7 @@ use crate::packet::{Packet, PoD};
 
 #[derive(FromBytes, IntoBytes, KnownLayout, Unaligned, Immutable)]
 #[repr(C, packed)]
+#[allow(dead_code)]
 pub(crate) struct Wg {
     pub packet_type: WgPacketType,
     rest: [u8],
