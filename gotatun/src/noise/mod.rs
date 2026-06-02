@@ -37,8 +37,7 @@ use crate::noise::rate_limiter::RateLimiter;
 use crate::noise::timers::{TimerName, Timers};
 
 pub use crate::noise::timers::TimerParams;
-use crate::packet::CheckedPayload;
-use crate::packet::{Packet, WgCookieReply, WgData, WgHandshakeInit, WgHandshakeResp, WgKind};
+use crate::packet::{Packet, PoD, WgCookieReply, WgData, WgHandshakeInit, WgHandshakeResp, WgKind};
 use crate::tun::MtuWatcher;
 use crate::x25519;
 
@@ -177,7 +176,7 @@ impl<R: RngCore + Send> Tunn<R> {
     }
 
     /// Apply AWG header type to an outgoing packet by overwriting the first 4 bytes.
-    fn apply_awg_header<T: CheckedPayload + ?Sized>(&self, packet: &mut Packet<T>, header: u32) {
+    fn apply_awg_header<T: PoD + ?Sized>(&self, packet: &mut Packet<T>, header: u32) {
         packet.buf_mut()[..4].copy_from_slice(&header.to_le_bytes());
     }
 
