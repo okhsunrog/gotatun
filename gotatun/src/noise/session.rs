@@ -352,7 +352,10 @@ mod tests {
         data.header = WgDataHeader::new()
             .with_receiver_idx(receiver_idx)
             .with_counter(counter);
-        let WgKind::Data(packet) = buf.try_into_wg().expect("is a wireguard packet") else {
+        let WgKind::Data(packet) = buf
+            .try_into_wg(&AwgConfig::default())
+            .expect("is a wireguard packet")
+        else {
             unreachable!("is a wireguard data packet");
         };
         packet

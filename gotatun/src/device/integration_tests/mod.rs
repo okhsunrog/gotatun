@@ -1119,7 +1119,7 @@ mod tests {
         let mut builder = DeviceBuilder::new()
             .create_tun(&rs_iface)
             .unwrap()
-            .with_udp(UdpSocketFactory)
+            .with_udp(UdpSocketFactory::default())
             .with_uapi(uapi);
         builder = builder.with_awg(awg.clone());
         let _rs_device = builder.build().await.unwrap();
