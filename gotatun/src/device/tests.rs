@@ -456,6 +456,38 @@ async fn suspend_and_resume() {
     drop((alice, bob));
 }
 
+/// Binding to port 0 reports the actual port, and keeps it across rebinds.
+#[tokio::test]
+#[test_log::test]
+async fn listen_port_zero_reports_bound_port() {
+    use crate::device::{DeviceBuilder, Peer};
+    use x25519_dalek::{PublicKey, StaticSecret};
+
+    let (tun, _app_tx, _app_rx) = mock::mock_tun();
+    let peer = Peer::new(PublicKey::from(&StaticSecret::random()));
+
+    let device = DeviceBuilder::new()
+        .with_private_key(StaticSecret::random())
+        .with_ip(tun)
+        .with_default_udp()
+        .with_listen_port(0)
+        .with_peer(peer)
+        .build()
+        .await
+        .expect("create device");
+
+    let port = device.read(async |d| d.listen_port()).await;
+    assert_ne!(port, 0);
+
+    device.suspend().await;
+    device.resume().await.expect("resume should succeed");
+
+    let port_after_resume = device.read(async |d| d.listen_port()).await;
+    assert_eq!(port, port_after_resume);
+
+    device.stop().await;
+}
+
 /// A reconfiguration that would normally rebuild the connection must not
 /// silently un-suspend the device: the change is applied to `DeviceState` but
 /// the connection stays down until [`Device::resume`].
@@ -537,6 +569,37 @@ async fn awg_data_flow() {
         _ = drive => {},
         _ = sleep(Duration::from_secs(5)) => panic!("awg_data_flow timeout"),
     }
+}
+
+/// Explicit handshakes must use AWG headers, padding, junk and I-packets too.
+#[tokio::test]
+#[test_log::test]
+async fn awg_force_handshake() {
+    let mut awg = AwgConfig {
+        h1: MagicHeader::range(1000, 1100),
+        h2: MagicHeader::range(2000, 2100),
+        h3: MagicHeader::range(3000, 3100),
+        h4: MagicHeader::range(4000, 4100),
+        s1: 32,
+        s2: 16,
+        s3: 8,
+        s4: 4,
+        jc: 2,
+        jmin: 40,
+        jmax: 50,
+        i_packets: [const { None }; 5],
+    };
+    awg.i_packets[0] = Some(ObfChain::parse("<b 0x11223344>").unwrap());
+    let (alice, mut bob, _eve) = mock::device_pair_with_awg(awg).await;
+    let key = get_first_and_only_peer(&alice).await.public_key;
+    timeout(Duration::from_secs(5), async {
+        alice.device.force_handshake(&key).await.unwrap();
+        let packet = mock::packet(b"after explicit AWG handshake");
+        alice.app_tx.send(packet.clone()).await;
+        assert_eq!(bob.app_rx.recv().await.as_bytes(), packet.as_bytes());
+    })
+    .await
+    .expect("AWG forced handshake and data flow");
 }
 
 /// Test that AWG obfuscation changes wire-level packet headers.
@@ -725,6 +788,68 @@ async fn awg_i_packets_wire_order() {
         _ = combined => {},
         _ = sleep(Duration::from_secs(5)) => panic!("awg_i_packets_wire_order timeout"),
     }
+}
+
+/// [`Device::force_handshake`] performs a single handshake, and nothing once a session exists.
+#[tokio::test]
+#[test_log::test]
+async fn force_handshake() {
+    use crate::device::Error;
+    use x25519_dalek::{PublicKey, StaticSecret};
+
+    let (alice, _bob, eve) = mock::device_pair().await;
+    let mut inits = std::pin::pin!(eve.wg_handshake_init());
+    let bob_public_key = get_first_and_only_peer(&alice).await.public_key;
+
+    // Concurrent callers share a single handshake.
+    let (first, second) = timeout(Duration::from_secs(2), async {
+        join!(
+            alice.device.force_handshake(&bob_public_key),
+            alice.device.force_handshake(&bob_public_key),
+        )
+    })
+    .await
+    .expect("session should be established");
+    first.expect("first wait should succeed");
+    second.expect("second wait should succeed");
+
+    let first_init = timeout(Duration::from_secs(1), inits.next())
+        .await
+        .expect("a handshake init should be observed");
+    assert!(first_init.is_some());
+
+    assert!(
+        timeout(Duration::from_millis(500), inits.next())
+            .await
+            .is_err(),
+        "no additional handshake init should be sent"
+    );
+
+    // With an active WireGuard session, no handshake is initiated.
+    alice
+        .device
+        .force_handshake(&bob_public_key)
+        .await
+        .expect("wait with a fresh session should succeed");
+
+    assert!(
+        timeout(Duration::from_millis(500), inits.next())
+            .await
+            .is_err(),
+        "no additional handshake init should be sent"
+    );
+
+    let unknown_peer = PublicKey::from(&StaticSecret::random());
+    assert!(matches!(
+        alice.device.force_handshake(&unknown_peer).await,
+        Err(Error::PeerNotFound)
+    ));
+
+    alice.device.suspend().await;
+    assert!(matches!(
+        alice.device.force_handshake(&bob_public_key).await,
+        Err(Error::NotConnected)
+    ));
 }
 
 /// Helper method to test that packets can be sent from one [`Device`] to another.
