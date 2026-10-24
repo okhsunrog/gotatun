@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 
+## [0.10.2] - 2026-10-20
+### Added
+- Add `PeerMut::dangerously_set_timer_params`, so that timer params can be changed
+  for an existing peer.
+
+
 ## [0.10.1] - 2026-10-16
 ### Fixed
 - Fix IP counts not resetting periodically for devices without registered peers.
